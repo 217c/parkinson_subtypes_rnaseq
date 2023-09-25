@@ -1,0 +1,1386 @@
+
+# libraries
+
+```{r include=FALSE}
+library(tidyverse)
+source("functions.r")
+library(tidymodels)
+library(themis)
+library(vip)
+
+rename <- dplyr::rename
+select <- dplyr::select
+```
+
+# imports
+
+```{r}
+# load(file = "../data/input/dds_objs_de.RData")
+
+df_cohort = read.csv("../data/input/study_cohort.csv")
+
+df_metadata = read.csv("../data/raw/subject_characteristics/Demographics.csv")
+
+# By Zhang 2019
+df_clusters = read.csv("../data/repos/PPMI-Subtype-Analysis-master/subtype/input/clustering_by_lstm.csv")
+```
+
+## RNA
+
+```{r}
+load("../data/input/classifier/selected_genes_data_train_e_test.rdata")
+```
+
+### TRAIN TEST SPLIT
+
+```{r}
+df_split = 
+  
+  bind_rows(
+    
+    df_selected_genes_train %>% 
+      pull(name) %>% 
+      unique() %>% 
+      gsub(pattern = "_BL", 
+           replacement = "") %>% 
+      as.data.frame() %>% 
+      rename(PATNO = ".") %>% 
+      mutate(split = "train"),
+    
+    df_selected_genes_test %>% 
+      pull(name) %>% 
+      unique() %>% 
+      gsub(pattern = "_BL", 
+           replacement = "") %>% 
+      as.data.frame() %>% 
+      rename(PATNO = ".") %>% 
+      mutate(split = "test")
+    
+  )
+
+df_split %>% 
+  left_join(df_clusters %>% mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  xtabs(data = ., formula = ~ split + CLUSTER_IDX) %>% addmargins()
+
+df_split %>% 
+  left_join(df_clusters %>% mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  group_by(split, CLUSTER_IDX) %>% 
+  tally() %>% 
+  ggplot() +
+  aes(x = split,
+      y = n,
+      fill = as.factor(CLUSTER_IDX)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = n),
+            position = position_dodge(width = .9), vjust = -.25) +
+  theme_bw()
+
+df_split_export = 
+df_split %>% 
+  left_join(df_clusters %>% mutate(PATNO = as.character(PATNO)), by = "PATNO") %>% 
+  group_by(split, CLUSTER_IDX) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(Subtype = paste0("S",CLUSTER_IDX), .keep = "unused", .after = split) %>% 
+  rename(Split = split)
+
+openxlsx::write.xlsx(df_split_export, "../data/input/classifier/splits.xlsx")
+```
+
+## demographics
+
+
+```{r}
+df_updrs = read.csv("../data/raw/motor_assessments/MDS-UPDRS_Part_III.csv")
+
+data_path = "../data/raw/demographics"
+demo_files = list.files(data_path)[str_detect(list.files(data_path), ".csv")] %>% sort()
+
+demo_list = list()
+for (i in 1:length(demo_files)) {
+
+  demo_list[[i]] = read.csv(file.path(data_path, demo_files[i]))
+}
+names(demo_list) = demo_files
+
+# age at visit
+df_age_visit = 
+  demo_list$Age_at_visit.csv %>% 
+  filter(EVENT_ID == "BL",
+         PATNO %in% df_cohort$PATNO)
+
+# age at diagnosis
+df_age_pd = 
+  demo_list$PD_Diagnosis_History.csv %>% 
+  select(PATNO, SXDT, PDDXDT) %>% 
+  left_join(demo_list$Demographics.csv %>% 
+              select(PATNO, BIRTHDT),
+            by = "PATNO") %>% 
+  mutate(across(contains("DT"), ~ as.Date(ifelse(.x == "", NA, paste0("01/", .x)), format = "%d/%m/%Y"))) %>% 
+  distinct() %>% 
+  filter(PATNO %in% df_cohort$PATNO) %>% 
+  mutate(age_at_symptoms = lubridate::time_length(difftime(SXDT, BIRTHDT, unit = "auto"), "years"),
+         age_at_diagnosis = lubridate::time_length(difftime(PDDXDT, BIRTHDT, unit = "auto"), "years"))
+
+# education years
+study_study = 
+  demo_list$`Socio-Economics.csv` %>% 
+  filter(PATNO %in% df_cohort$PATNO) %>% 
+  select(PATNO, EVENT_ID, INFODT, EDUCYRS) %>% 
+  rename(INFODT_study = INFODT) %>% 
+  distinct() %>% 
+  left_join(df_updrs %>% 
+              filter(EVENT_ID == "BL",
+                     PATNO %in% df_cohort$PATNO) %>% 
+              select(PATNO, INFODT) %>% 
+              rename(INFODT_bl = INFODT),
+            by = "PATNO") %>% 
+  mutate(across(contains("DT"), ~ as.Date(ifelse(.x == "", NA, paste0("01/", .x)), format = "%d/%m/%Y")),
+         time_between = abs(difftime(INFODT_study, INFODT_bl, unit = "days"))) %>% 
+  filter(EVENT_ID == "SC")
+
+df_study = 
+  study_study %>% 
+  select(PATNO, EDUCYRS)
+
+
+
+# join all
+df_demo = 
+  plyr::join_all(
+    list(
+      df_age %>% 
+        select(PATNO, AGE_AT_VISIT),
+      df_age_pd %>% 
+        select(PATNO, age_at_symptoms, age_at_diagnosis),
+      df_study
+    ),
+    by = "PATNO"
+  )
+
+
+df_demo %>% 
+  pivot_longer(cols = 2:last_col()) %>% 
+  ggplot() +
+  aes(x = value) +
+  geom_histogram(aes(y = ..density..)) +
+  geom_density() +
+  facet_wrap(~ name, scales = "free") +
+  theme_bw()
+```
+
+## nma
+
+MoCA: Montreal Cognitive Assessment; 
+BJLO: Benton Judgment of Line Orientation; 
+ESS: Epworth Sleepiness Scale; 
+RBD: Rapid eye movement sleep Behavior Disorder; 
+GDS: Geriatric Depression Scale; 
+HVLT: Hopkin’s Verbal Learning Test; 
+LNS: Letter Number Sequencing; 
+QUIP: Questionnaire for Impulsive-Compulsive Disorders in Parkinson’s Disease; 
+SCOPA-AUT: SCales for Outcomes in PArkinson’s disease-AUTomotic symptoms; 
+STAI: State Trait Anxiety Inventory; 
+SDMT: Symbol Digit Modalities Test
+Semantic Fluency
+
+```{r}
+data_path = "../data/raw/non_motor_assessment"
+nma_files = list.files(data_path)[str_detect(list.files(data_path), ".csv")] %>% sort()
+
+nma_list = list()
+for (i in 1:length(nma_files)) {
+  
+  nma_list[[i]] = read.csv(file.path(data_path, nma_files[i]))
+}
+names(nma_list) = nma_files
+```
+
+### make df
+
+```{r}
+df_nma =
+  bind_rows(
+    nma_list$Benton_Judgement_of_Line_Orientation.csv %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, JLO_TOTRAW) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$Epworth_Sleepiness_Scale.csv %>% 
+      select(-PTCGBOTH) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$Geriatric_Depression_Scale__Short_Version_.csv %>%
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$`Hopkins_Verbal_Learning_Test_-_Revised.csv` %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, contains("DVT_")) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$`Letter_-_Number_Sequencing.csv` %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, LNS_TOTRAW) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$Montreal_Cognitive_Assessment__MoCA_.csv %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, MCATOT) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$`QUIP-Current-Short.csv` %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$REM_Sleep_Behavior_Disorder_Questionnaire.csv %>% 
+      select(-PTCGBOTH) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$`SCOPA-AUT.csv` %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      select(-PTCGBOTH, -SCAU24, -SCAU25, -SCAU22, -SCAU23, -SCAU23A) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$Symbol_Digit_Modalities_Test.csv %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, SDMTOTAL) %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$Modified_Semantic_Fluency.csv %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, contains("VLT")) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var"),
+    
+    nma_list$`State-Trait_Anxiety_Inventory.csv` %>% 
+      filter(PATNO %in% df_clusters$PATNO) %>% 
+      filter(EVENT_ID %in% c("BL", "SC")) %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, where(is.numeric)) %>% 
+      mutate(PATNO = as.character(PATNO)) %>% 
+      pivot_longer(cols = where(is.numeric),
+                   names_to = "var")
+  )
+```
+
+### Split
+
+```{r}
+df_nma_train = 
+  df_nma %>% 
+  filter(PATNO %in% ( df_split %>% filter(split == "train") %>% pull(PATNO) ) )
+
+df_nma_test =
+  df_nma %>% 
+  filter(PATNO %in% ( df_split %>% filter(split == "test") %>% pull(PATNO) ) )
+```
+
+### imputation
+
+using the mean
+```{r}
+df_nma_means_train = 
+  df_nma_train %>% 
+  group_by(var) %>% 
+  summarise(var_mean = mean(value, na.rm = T))
+
+df_nma_train_imp = 
+  df_nma_train %>% 
+  select(-EVENT_ID, -PAG_NAME) %>% 
+  pivot_wider(names_from = var,
+              values_from = value) %>% 
+  mutate(across(.cols = where(is.numeric),
+                .fns = ~ ifelse(is.na(.x), 
+                                df_nma_means_train %>% 
+                                  filter(var == cur_column()) %>% 
+                                  pull(var_mean) %>% 
+                                  round(),
+                                .x))) %>% 
+  pivot_longer(cols = where(is.numeric),
+               names_to = "var")
+
+df_nma_test_imp = 
+  df_nma_test %>% 
+  select(-EVENT_ID, -PAG_NAME) %>% 
+  pivot_wider(names_from = var,
+              values_from = value) %>%
+  mutate(across(.cols = where(is.numeric),
+                .fns = ~ ifelse(is.na(.x), 
+                                df_nma_means_train %>% 
+                                  filter(var == cur_column()) %>% 
+                                  pull(var_mean) %>% 
+                                  round(),
+                                .x))) %>% 
+  pivot_longer(cols = where(is.numeric),
+               names_to = "var")
+```
+
+### Compute total scores
+
+```{r}
+df_nma_train_imp_forselection = 
+  df_nma_train_imp %>%
+  left_join(df_nma %>%
+              select(PAG_NAME, var) %>% 
+              mutate(PAG_NAME = ifelse(PAG_NAME == "BENTONEV", "BENTONOD", PAG_NAME)) %>% 
+              distinct(),
+            by = "var") %>% 
+  filter(PAG_NAME %in% c("EPWORTH",
+                         "GDSSHORT",
+                         "QUIPCS",
+                         "REMSLEEP",
+                         "SCOPAAUT",
+                         "STAI")) %>% 
+  group_by(PATNO, PAG_NAME) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup() %>% 
+  mutate(var = paste0(PAG_NAME, "_tot")) %>% 
+  select(-PAG_NAME) %>% 
+  bind_rows(
+    df_nma_train_imp %>%
+      left_join(df_nma %>%
+                  select(PAG_NAME, var) %>% 
+                  mutate(PAG_NAME = ifelse(PAG_NAME == "BENTONEV", "BENTONOD", PAG_NAME)) %>% 
+                  distinct(),
+                by = "var") %>% 
+      filter(!PAG_NAME %in% c("EPWORTH",
+                              "GDSSHORT",
+                              "QUIPCS",
+                              "REMSLEEP",
+                              "SCOPAAUT",
+                              "STAI")) %>% 
+      select(-PAG_NAME)
+  )
+
+df_nma_test_imp_forselection = 
+  df_nma_test_imp %>%
+  left_join(df_nma %>%
+              select(PAG_NAME, var) %>% 
+              mutate(PAG_NAME = ifelse(PAG_NAME == "BENTONEV", "BENTONOD", PAG_NAME)) %>%
+              distinct(),
+            by = "var") %>% 
+  filter(PAG_NAME %in% c("EPWORTH",
+                         "GDSSHORT",
+                         "QUIPCS",
+                         "REMSLEEP",
+                         "SCOPAAUT",
+                         "STAI")) %>% 
+  group_by(PATNO, PAG_NAME) %>% 
+  summarise(value = sum(value)) %>% 
+  ungroup() %>% 
+  mutate(var = paste0(PAG_NAME, "_tot")) %>% 
+  select(-PAG_NAME) %>% 
+  bind_rows(
+    df_nma_test_imp %>%
+      left_join(df_nma %>%
+                  select(PAG_NAME, var) %>% 
+                  mutate(PAG_NAME = ifelse(PAG_NAME == "BENTONEV", "BENTONOD", PAG_NAME)) %>%
+                  distinct(),
+                by = "var") %>% 
+      filter(!PAG_NAME %in% c("EPWORTH",
+                              "GDSSHORT",
+                              "QUIPCS",
+                              "REMSLEEP",
+                              "SCOPAAUT",
+                              "STAI")) %>% 
+      select(-PAG_NAME)
+  )
+```
+
+## motor
+
+### UPDRS
+
+#### import
+
+```{r}
+data_path = "../data/raw/motor_assessments"
+updrs_files = list.files(data_path)[str_detect(list.files(data_path), "UPDRS")] %>% sort()
+
+updrs_list = list()
+for (i in 1:length(updrs_files)) {
+  print(updrs_files[i])
+  
+  updrs_list[[i]] = read.csv(file.path(data_path, updrs_files[i]))
+}
+names(updrs_list) = updrs_files
+
+df_updrs = 
+  updrs_list %>% 
+  lapply(
+    .,
+    function(x) x %>% 
+      select(PATNO, EVENT_ID, PAG_NAME, INFODT, contains("TOT"), ORIG_ENTRY, LAST_UPDATE) %>% 
+      pivot_longer(cols = contains("TOT"),
+                   names_to = "variable") 
+  ) %>% 
+  bind_rows(.id = "file") %>% 
+  filter(str_detect(file, "Part_IV", negate = T),
+         EVENT_ID == "BL",
+         PATNO %in% df_cohort$PATNO) %>% 
+  relocate(file, .after = last_col())
+
+# df_updrs %>% 
+#   ggplot() +
+#   aes(x = value) +
+#   geom_histogram(aes(y = ..density..)) +
+#   geom_density(alpha = .3) +
+#   theme_bw() +
+#   facet_wrap(~ variable, scales = "free")
+```
+
+
+### Hoehn & Yahr
+
+```{r}
+df_hy = 
+  read.csv("../data/raw/motor_assessments/MDS-UPDRS_Part_III.csv") %>% 
+  select(PATNO, EVENT_ID, NHY) %>% 
+  filter(EVENT_ID == "BL",
+         PATNO %in% df_cohort$PATNO) %>% 
+  arrange(PATNO)
+
+df_hy %>% 
+  left_join(df_cohort, by = "PATNO") %>% 
+  ggplot() +
+  aes(x = reorder(as.character(PATNO), NHY), 
+      y = NHY,
+      fill = group) +
+  geom_col() +
+  coord_flip() +
+  theme_bw()
+```
+
+## CSF
+
+```{r}
+df_bio = read.csv("../data/raw/biospecimen/Current_Biospecimen_Analysis_Results.csv")
+
+df_bio_filtered = df_bio[-(df_bio %>% .$TESTVALUE %>% as.numeric() %>% is.na() %>% which()),] %>% 
+  mutate(TESTVALUE = as.numeric(TESTVALUE)) %>% 
+  mutate(RUNDATE = as.Date(RUNDATE, format = "%Y-%m-%d")) %>% 
+  group_by(CLINICAL_EVENT, PATNO, PROJECTID, TESTNAME) %>% 
+  filter(RUNDATE == max(RUNDATE)) %>% 
+  ungroup()
+
+df_bio_count = 
+  df_bio_filtered %>% 
+  select(TYPE, PROJECTID, TESTNAME, CLINICAL_EVENT, COHORT, PATNO, TESTVALUE) %>% 
+  distinct() %>% 
+  filter(PATNO %in% df_cohort$PATNO) %>% 
+  group_by(TYPE, PROJECTID, TESTNAME, CLINICAL_EVENT, COHORT) %>% 
+  summarise(n_measures = n(),
+            n_unique_subjects = n_distinct(PATNO),
+            .groups = "drop_last") %>% 
+  ungroup() %>%
+  mutate(across(.cols = where(is_integer),
+                .fns = ~ replace_na(.x, 0))) %>% 
+  arrange(-n_unique_subjects)
+
+df_bio_toinclude = 
+  df_bio_count %>% 
+  filter(n_unique_subjects >= 370,
+         CLINICAL_EVENT == "BL",
+         COHORT == "PD")
+
+df_csf =
+  df_bio_filtered %>% 
+  filter(PATNO %in% df_cohort$PATNO,
+         CLINICAL_EVENT == "BL",
+         PROJECTID %in% df_bio_toinclude$PROJECTID,
+         TESTNAME %in% df_bio_toinclude$TESTNAME) %>% 
+  filter(PATNO %in% df_cohort$PATNO,
+         PROJECTID %in% c(125, 124),
+         CLINICAL_EVENT == "BL")
+```
+
+
+# imaging
+
+```{r}
+df_datscan = read.csv("../data/raw/imaging/DaTScan_Analysis_17May2023.csv")
+
+# df_datscan
+```
+
+# join all
+
+```{r}
+df_all = 
+  plyr::join_all(
+    list(
+      df_selected_genes_train %>%
+        bind_rows(df_selected_genes_test) %>% 
+        select(-group) %>% 
+        pivot_wider(names_from = gene,
+                    values_from = value) %>% 
+        mutate(PATNO = str_remove(name, "_BL"),
+               .keep = "unused", 
+               .before = everything()),
+      
+      df_demo %>% 
+        select(PATNO, AGE_AT_VISIT, EDUCYRS) %>% 
+        filter(PATNO %in% df_split$PATNO),
+      
+      bind_rows(
+        df_nma_train_imp_forselection,
+        df_nma_test_imp_forselection
+      ) %>% 
+        pivot_wider(names_from = var,
+                    values_from = value),
+      
+      df_updrs %>% 
+        select(PATNO, variable, value) %>% 
+        pivot_wider(names_from = variable,
+                    values_from = value) %>% 
+        filter(PATNO %in% df_split$PATNO),
+      
+      df_hy %>% 
+        select(-EVENT_ID) %>% 
+        filter(PATNO %in% df_split$PATNO),
+      
+      df_csf %>% 
+        select(PATNO, TESTNAME, TESTVALUE) %>% 
+        pivot_wider(names_from = TESTNAME,
+                    values_from = TESTVALUE) %>% 
+        filter(PATNO %in% df_split$PATNO),
+      
+      df_datscan %>% 
+        select(PATNO, EVENT_ID, DATSCAN_CAUDATE_R, DATSCAN_CAUDATE_L, DATSCAN_PUTAMEN_R, DATSCAN_PUTAMEN_L) %>% 
+        filter(EVENT_ID == "SC",
+               PATNO %in% df_split$PATNO) %>% 
+        select(-EVENT_ID)
+    ),
+    by = "PATNO"
+  )
+
+```
+
+```{r}
+# df_all %>% skimr::skim() %>% as.data.frame() %>% arrange(-n_missing)
+```
+
+# SPLIT
+
+```{r}
+df_all_train = 
+  df_all %>% 
+  filter(PATNO %in% (df_split %>% filter(split=="train") %>% pull(PATNO)))
+
+df_all_test = 
+  df_all %>% 
+  filter(PATNO %in% (df_split %>% filter(split=="test") %>% pull(PATNO)))
+```
+
+# IMPUTE
+
+```{r}
+df_all_means_train = 
+  df_all_train %>% 
+  pivot_longer(cols = 2:last_col(),
+               names_to = "var") %>% 
+  group_by(var) %>% 
+  summarise(var_mean = mean(value, na.rm=T))
+
+df_all_train_imp = 
+  df_all_train %>% 
+  mutate(across(.cols = 2:last_col(),
+                .fns = ~ ifelse(is.na(.x), 
+                                df_all_means_train %>% 
+                                  filter(var == cur_column()) %>% 
+                                  pull(var_mean),
+                                .x)))
+
+df_all_test_imp = 
+  df_all_test %>% 
+  mutate(across(.cols = 2:last_col(),
+                .fns = ~ ifelse(is.na(.x), 
+                                df_all_means_train %>% 
+                                  filter(var == cur_column()) %>% 
+                                  pull(var_mean),
+                                .x)))
+```
+
+# transform
+here i apply box cox trans before ANOVA
+
+## train
+```{r}
+library(caret)
+
+df_bc =
+  df_all_train_imp %>% 
+  pivot_longer(cols = 2:last_col(),
+               names_to = "var") %>% 
+  filter(str_detect(var, "ENSG", negate = T)) %>% 
+  group_by(var) %>% 
+  nest() %>% 
+  mutate(bc = map(.x = data,
+                  .f = ~ BoxCoxTrans(.x$value+1)),
+         trans = map2(.x = data,
+                      .y = bc,
+                      .f = ~ data.frame(PATNO = .x$PATNO,
+                                        value_trans = predict(.y, .x$value+1)))) %>% 
+  ungroup()
+
+df_all_train_imp_trans = 
+  df_bc %>% 
+  select(-data, -bc) %>% 
+  unnest(trans)
+
+df_all_train_imp_trans %>% 
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO),
+                     CLUSTER_IDX = as.factor(CLUSTER_IDX)),
+            by = "PATNO") %>% 
+  relocate(CLUSTER_IDX, .after = "PATNO") %>% 
+  ggplot() +
+  aes(x = value_trans,
+      fill = CLUSTER_IDX) +
+  geom_density(alpha = .3) +
+  theme_bw() +
+  facet_wrap(~var, scales = "free")
+```
+
+## test
+
+```{r}
+df_all_test_imp_trans = 
+  df_all_test_imp %>% 
+  pivot_longer(cols = 2:last_col(),
+               names_to = "var") %>% 
+  filter(str_detect(var, "ENSG", negate = T)) %>% 
+  group_by(var) %>% 
+  nest() %>% 
+  left_join(df_bc %>% select(var, bc), by = "var") %>% 
+  mutate(trans = map2(.x = data,
+                      .y = bc,
+                      .f = ~ data.frame(PATNO = .x$PATNO,
+                                        value_trans = predict(.y, .x$value+1)))) %>% 
+  ungroup() %>% 
+  select(-data, -bc) %>% 
+  unnest(trans)
+
+df_all_test_imp_trans %>% 
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO),
+                     CLUSTER_IDX = as.factor(CLUSTER_IDX)),
+            by = "PATNO") %>% 
+  relocate(CLUSTER_IDX, .after = "PATNO") %>% 
+  ggplot() +
+  aes(x = value_trans,
+      fill = CLUSTER_IDX) +
+  geom_density(alpha = .3) +
+  theme_bw() +
+  facet_wrap(~var, scales = "free")
+```
+
+# SELECTION
+
+```{r}
+df_anova_clin = 
+  df_all_train_imp_trans %>% 
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO),
+                     CLUSTER_IDX = as.factor(CLUSTER_IDX)),
+            by = "PATNO") %>% 
+  pivot_wider(names_from = var,
+              values_from = value_trans) %>% 
+  anova_filter_enhanced(grouping_var = "CLUSTER_IDX")
+```
+
+## import ANOVA results
+
+```{r}
+df_anova_gene = openxlsx::read.xlsx( "../data/input/classifier/anova_res.xlsx")
+
+df_anova_all = 
+  bind_rows(
+    df_anova_clin %>% 
+      select(y, df, statistic, p.value),
+    df_anova_gene %>% 
+      rename(y = gene) %>% 
+      select(y, df, statistic, p.value)
+  ) %>% 
+  mutate(p_sig = p.value <= 0.05,
+         p_adj_fdr = p.adjust(p.value, method = "fdr"),
+         p_adj_fdr_sig = p_adj_fdr <= 0.05,
+         p_adj_bon = p.adjust(p.value, method = "bonferroni"),
+         p_adj_bon_sig = p_adj_bon <= 0.05) %>% 
+  arrange(p.value)
+
+df_anova_all
+
+```
+
+# CLASSIFICATION
+
+## data
+
+### train
+```{r}
+df_rna_train = readRDS("../data/input/classifier/train_rna_data.rds")
+
+df_train_ml = 
+  bind_rows(
+    
+    df_all_train_imp_trans %>% 
+      filter(
+        var %in% ( 
+          df_anova_all %>% 
+            filter(p_adj_fdr_sig) %>% 
+            pull(y) 
+        )  
+      ) %>% 
+      rename(value = value_trans),
+    
+    df_rna_train %>% 
+      filter(
+        gene %in% ( 
+          df_anova_all %>% 
+            filter(p_adj_fdr_sig) %>% 
+            pull(y)
+        ) 
+      ) %>% 
+      mutate(PATNO = str_remove(name, "_BL"), .keep = "unused") %>% 
+      select(-group) %>% 
+      rename(var = gene)
+    
+  ) %>% 
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO),
+                     CLUSTER_IDX = as.factor(CLUSTER_IDX)),
+            by = "PATNO") %>% 
+  pivot_wider(names_from = var,
+              values_from = value)
+
+df_train_ml %>% 
+  pivot_longer(cols = 3:last_col()) %>% 
+  ggplot() +
+  aes(x = value,
+      fill = CLUSTER_IDX) +
+  geom_density(alpha = .3) +
+  facet_wrap(~ name, scales = "free") +
+  theme_bw()
+
+df_train_ml$CLUSTER_IDX %>% table()
+```
+
+### test
+```{r}
+df_rna_test = readRDS("../data/input/classifier/test_rna_data.rds")
+
+df_test_ml = 
+  bind_rows(
+    
+    df_all_test_imp_trans %>% 
+      filter(
+        var %in% ( 
+          df_anova_all %>% 
+            filter(p_adj_fdr_sig) %>% 
+            pull(y) 
+        )  
+      ) %>% 
+      rename(value = value_trans),
+    
+    df_rna_test %>% 
+      filter(
+        gene %in% ( 
+          df_anova_all %>% 
+            filter(p_adj_fdr_sig) %>% 
+            pull(y)
+        ) 
+      ) %>% 
+      mutate(PATNO = str_remove(name, "_BL"), .keep = "unused") %>% 
+      select(-group) %>% 
+      rename(var = gene)
+    
+  ) %>% 
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO),
+                     CLUSTER_IDX = as.factor(CLUSTER_IDX)),
+            by = "PATNO") %>% 
+  pivot_wider(names_from = var,
+              values_from = value)
+
+df_test_ml %>% 
+  pivot_longer(cols = 3:last_col()) %>% 
+  ggplot() +
+  aes(x = value,
+      fill = CLUSTER_IDX) +
+  geom_density(alpha = .3) +
+  facet_wrap(~ name, scales = "free") +
+  theme_bw()
+
+df_test_ml$CLUSTER_IDX %>% table()
+
+df_test_ml %>% 
+  select(PATNO, CLUSTER_IDX)
+```
+
+# HIERARCHICAL 1
+
+## split obj
+
+```{r}
+df_train_ml_2_1 = 
+  df_train_ml %>% 
+  mutate(new_class = as.factor(ifelse(CLUSTER_IDX == 2, 1, CLUSTER_IDX)), 
+         .before = everything()) %>% 
+  select(-PATNO, -CLUSTER_IDX) %>% 
+  droplevels()
+
+df_test_ml_2_1 = 
+  df_test_ml %>% 
+  mutate(new_class = as.factor(ifelse(CLUSTER_IDX == 2, 1, CLUSTER_IDX)),
+         .before = everything()) %>% 
+  select(-PATNO, -CLUSTER_IDX) %>%
+  droplevels()
+
+
+split_ml_2_1 = 
+  make_splits(x = df_train_ml_2_1,
+              assessment = df_test_ml_2_1)
+
+train_split_ml_2_1 = training(split_ml_2_1)  
+test_split_ml_2_1 = testing(split_ml_2_1) 
+
+df_train_ml$CLUSTER_IDX %>% table()
+df_test_ml$CLUSTER_IDX %>% table()
+df_train_ml_2_1$new_class %>% table()
+df_test_ml_2_1$new_class %>% table()
+```
+
+## set workflow
+
+### model
+```{r}
+xgb_spec_2_1 <- 
+  boost_tree(
+    trees = 1000,
+    tree_depth = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),                    
+    sample_size = tune(),
+    mtry = tune(),         
+    learn_rate = tune()                          
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_spec_2_1
+```
+
+### hyperparameters
+```{r}
+set.seed(217)
+xgb_grid_2_1 <- 
+  grid_latin_hypercube(
+    tree_depth(),
+    min_n(),
+    loss_reduction(),
+    sample_size = sample_prop(),
+    finalize(mtry(), train_split_ml_2_1),
+    learn_rate(),
+    size = 30
+  )
+
+xgb_grid_2_1
+```
+
+### workflow
+```{r}
+set.seed(217)
+imbal_rec_2_1 <-
+  recipe(new_class ~ .,
+         data = train_split_ml_2_1) %>%
+  step_corr(all_predictors(), threshold = 0.8) %>% 
+  step_smote(new_class, seed = 217)
+
+xgb_wf_2_1 <-
+  workflow() %>%
+  add_model(xgb_spec_2_1) %>%
+  add_recipe(imbal_rec_2_1)
+
+xgb_wf_2_1
+```
+
+### CV folds
+```{r}
+set.seed(217)
+cv_folds_2_1 <- vfold_cv(train_split_ml_2_1, strata = new_class)
+
+cv_folds_2_1
+```
+
+## train model
+
+```{r}
+set.seed(217)
+library(doParallel)
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+set.seed(217, kind = "L'Ecuyer-CMRG")
+clusterEvalQ(cl, set.seed(217))
+xgb_res_2_1 <- 
+  tune_grid(
+    xgb_wf_2_1,
+    resamples = cv_folds_2_1,
+    grid = xgb_grid_2_1,
+    control = control_grid(save_pred = TRUE)
+  )
+
+xgb_res_2_1
+
+stopCluster(cl)
+closeAllConnections()
+```
+
+
+## get results
+
+```{r}
+collect_metrics(xgb_res_2_1)
+
+xgb_res_2_1 %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC") +
+  theme_bw()
+
+show_best(xgb_res_2_1, "roc_auc")
+
+best_auc_2_1 <- select_best(xgb_res_2_1, "roc_auc")
+best_auc_2_1
+
+final_xgb_2_1 <-
+  finalize_workflow(
+    xgb_wf_2_1,
+    best_auc_2_1
+  )
+
+final_xgb_2_1
+```
+### plot Importance
+
+```{r}
+final_xgb_2_1 %>%
+  fit(data = train_split_ml_2_1) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col") +
+  theme_bw()
+```
+
+## final model
+
+```{r}
+set.seed(217)
+final_res_2_1 <- last_fit(final_xgb_2_1,
+                          split = split_ml_2_1,
+                          metrics = metric_set(accuracy,
+                                               bal_accuracy,
+                                               roc_auc,
+                                               j_index,
+                                               f_meas))
+
+collect_metrics(final_res_2_1)
+
+final_res_2_1$.predictions[[1]] %>% 
+  conf_mat(new_class, .pred_class)
+
+final_res_2_1$.predictions[[1]] %>%
+  conf_mat(new_class, .pred_class) %>% summary()
+```
+
+# HIERARCHICAL 2
+
+## split obj
+
+```{r}
+df_train_ml_2_2 = 
+  df_train_ml %>%
+  filter(CLUSTER_IDX != 3) %>%
+  droplevels() %>%
+  select(-PATNO)
+
+df_test_ml_2_2 =
+ df_test_ml %>%
+  filter(CLUSTER_IDX != 3) %>%
+  droplevels() %>%
+  select(-PATNO)
+
+split_ml_2_2 = 
+  make_splits(x = df_train_ml_2_2,
+              assessment = df_test_ml_2_2)
+
+train_split_ml_2_2 = training(split_ml_2_2)  
+test_split_ml_2_2 = testing(split_ml_2_2) 
+
+df_train_ml$CLUSTER_IDX %>% table()
+df_test_ml$CLUSTER_IDX %>% table()
+df_train_ml_2_2$CLUSTER_IDX %>% table()
+df_test_ml_2_2$CLUSTER_IDX %>% table()
+```
+
+```{r}
+df_train_ml_2_2 %>% 
+  colnames()
+```
+
+
+## set workflow
+
+### model
+```{r}
+xgb_spec_2_2 <- 
+  boost_tree(
+    trees = 1000,
+    tree_depth = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),                    
+    sample_size = tune(),
+    mtry = tune(),         
+    learn_rate = tune()                          
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_spec_2_2
+```
+
+### hyperparameters
+```{r}
+set.seed(217)
+xgb_grid_2_2 <- 
+  grid_latin_hypercube(
+    tree_depth(),
+    min_n(),
+    loss_reduction(),
+    sample_size = sample_prop(),
+    finalize(mtry(), train_split_ml_2_2),
+    learn_rate(),
+    size = 30
+  )
+
+xgb_grid_2_2
+```
+
+### workflow
+```{r}
+set.seed(217)
+imbal_rec_2_2 <-
+  recipe(CLUSTER_IDX ~ .,
+         data = train_split_ml_2_2) %>%
+  step_corr(all_predictors(), threshold = 0.8) %>% 
+  step_smote(CLUSTER_IDX, seed = 217)
+
+xgb_wf_2_2 <-
+  workflow() %>%
+  add_model(xgb_spec_2_2) %>%
+  add_recipe(imbal_rec_2_2)
+
+xgb_wf_2_2
+```
+
+### CV folds
+```{r}
+set.seed(217)
+cv_folds_2_2 <- vfold_cv(train_split_ml_2_2, strata = CLUSTER_IDX)
+
+cv_folds_2_2
+```
+
+## train model
+
+```{r}
+set.seed(217)
+library(doParallel)
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+set.seed(217, kind = "L'Ecuyer-CMRG")
+clusterEvalQ(cl, set.seed(217))
+xgb_res_2_2 <- 
+  tune_grid(
+    xgb_wf_2_2,
+    resamples = cv_folds_2_2,
+    grid = xgb_grid_2_2,
+    control = control_grid(save_pred = TRUE)
+  )
+
+xgb_res_2_2
+
+stopCluster(cl)
+closeAllConnections()
+```
+
+
+## get results
+
+```{r}
+collect_metrics(xgb_res_2_2)
+
+xgb_res_2_2 %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC") +
+  theme_bw()
+
+show_best(xgb_res_2_2, "roc_auc")
+
+best_auc_2_2 <- select_best(xgb_res_2_2, "roc_auc")
+best_auc_2_2
+
+final_xgb_2_2 <-
+  finalize_workflow(
+    xgb_wf_2_2,
+    best_auc_2_2
+  )
+
+final_xgb_2_2
+```
+### plot Importance
+
+```{r}
+final_xgb_2_2 %>%
+  fit(data = train_split_ml_2_2) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col") +
+  theme_bw()
+```
+
+## final model
+
+```{r}
+set.seed(217)
+final_res_2_2 <- last_fit(final_xgb_2_2,
+                          split = split_ml_2_2,
+                          metrics = metric_set(accuracy,
+                                             bal_accuracy,
+                                             roc_auc,
+                                             j_index,
+                                             f_meas))
+
+collect_metrics(final_res_2_2)
+
+final_res_2_2$.predictions[[1]] %>% 
+  conf_mat(CLUSTER_IDX, .pred_class)
+
+final_res_2_2$.predictions[[1]] %>% 
+  conf_mat(CLUSTER_IDX, .pred_class) %>% summary()
+```
+
+# SHAP
+
+## 2_1
+
+```{r}
+library(shapviz)
+
+# Preprocessing the test data
+test_split_ml_2_1_prep <- bake(
+  prep(imbal_rec_2_1), 
+  has_role("predictor"),
+  new_data = test_split_ml_2_1, 
+  composition = "matrix"
+)
+
+# Extract the fitted model from the final workflow object
+xgboost_model_2_1 <- extract_fit_engine(final_res_2_1$.workflow[[1]])
+
+# Generate the shap object
+shap <- shapviz(xgboost_model_2_1, X_pred = test_split_ml_2_1_prep, X = test_split_ml_2_1)
+
+sv_importance(shap, kind = "both", show_numbers = TRUE) +
+  theme_bw() + 
+  theme(axis.text.y = element_text(colour = "black", face = "bold"))
+
+ggsave("../data/plots/SHAP/importance_2_1.png",
+       units = "cm",
+       width = 20,
+       height = 12,
+       dpi = 300)
+
+sv_dependence(shap, "NP2PTOT", color_var = "auto") + theme_bw()
+sv_dependence(shap, "NP2PTOT", color_var = NULL) + theme_bw()
+sv_force(shap, row_id = 61:96)
+sv_force(shap, row_id = 96)
+sv_force(shap, row_id = 1)
+sv_waterfall(shap, row_id = 96)
+
+
+```
+
+## 2_2
+
+```{r}
+library(shapviz)
+
+# Preprocessing the test data
+test_split_ml_2_2_prep <- bake(
+  prep(imbal_rec_2_2), 
+  has_role("predictor"),
+  new_data = test_split_ml_2_2, 
+  composition = "matrix"
+)
+
+# Extract the fitted model from the final workflow object
+xgboost_model_2_2 <- extract_fit_engine(final_res_2_2$.workflow[[1]])
+
+# Generate the shap object
+shap <- shapviz(xgboost_model_2_2, X_pred = test_split_ml_2_2_prep, X = test_split_ml_2_2)
+
+sv_importance(shap, kind = "both", show_numbers = TRUE) +
+  theme_bw() + 
+  theme(axis.text.y = element_text(colour = "black", face = "bold"))
+
+ggsave("../data/plots/SHAP/importance_2_2.png",
+       units = "cm",
+       width = 20,
+       height = 12,
+       dpi = 300)
+
+sv_dependence(shap, "NP2PTOT", color_var = "auto") + theme_bw()
+sv_dependence(shap, "NP2PTOT", color_var = NULL) + theme_bw()
+sv_force(shap, row_id = 1)
+sv_waterfall(shap, row_id = 1)
+
+citation("shapviz")
+```
+
+# confusion matrix
+
+```{r}
+library(cvms)
+
+final_res_3$.predictions[[1]] %>% 
+  conf_mat(CLUSTER_IDX, .pred_class) %>% 
+  broom::tidy() %>% 
+  separate_wider_delim(cols = name,
+                       delim = "_",
+                       names = c("cell", "Prediction", "Target")) %>% 
+  select(-cell) %>% 
+  rename(N = value) %>% 
+  plot_confusion_matrix(target_col = "Target",
+                        prediction_col = "Prediction",
+                        counts_col = "N", 
+                        palette = "Greys",
+                        class_order = rev(c("1","2","3")),
+                        add_counts = T,
+                        add_normalized = F,
+                        rm_zero_text = F,
+                        rm_zero_percentages = F,
+                        font_counts = cvms::font(size = 20),
+                        font_row_percentages = cvms::font(size = 7),
+                        font_col_percentages = cvms::font(size = 7)) +
+  theme(text = element_text(size = 25),
+        axis.text = element_text(colour = "black"))
+
+final_res_2_1$.predictions[[1]] %>% 
+  conf_mat(new_class, .pred_class) %>% 
+  broom::tidy() %>% 
+  separate_wider_delim(cols = name,
+                       delim = "_",
+                       names = c("cell", "Prediction", "Target")) %>% 
+  select(-cell) %>% 
+  rename(N = value) %>% 
+  mutate(across(everything(), ~ ifelse(.x == 2, 3, .x))) %>% 
+  mutate(across(everything(), ~ ifelse(.x == 1, "1 or 2", .x))) %>% 
+  plot_confusion_matrix(target_col = "Target",
+                        prediction_col = "Prediction",
+                        counts_col = "N", 
+                        palette = "Greys",
+                        class_order = rev(c("1 or 2","3")),
+                        add_counts = T,
+                        add_normalized = F,
+                        rm_zero_text = F,
+                        rm_zero_percentages = F,
+                        font_counts = cvms::font(size = 20),
+                        font_row_percentages = cvms::font(size = 7),
+                        font_col_percentages = cvms::font(size = 7)) +
+  theme(text = element_text(size = 25),
+        axis.text = element_text(colour = "black"))
+
+final_res_2_2$.predictions[[1]] %>% 
+  conf_mat(CLUSTER_IDX, .pred_class) %>% 
+  broom::tidy() %>% 
+  separate_wider_delim(cols = name,
+                       delim = "_",
+                       names = c("cell", "Prediction", "Target")) %>% 
+  select(-cell) %>% 
+  rename(N = value) %>% 
+  plot_confusion_matrix(target_col = "Target",
+                        prediction_col = "Prediction",
+                        counts_col = "N", 
+                        palette = "Greys",
+                        class_order = rev(c("1","2")),
+                        add_counts = T,
+                        add_normalized = F,
+                        rm_zero_text = F,
+                        rm_zero_percentages = F,
+                        font_counts = cvms::font(size = 20),
+                        font_row_percentages = cvms::font(size = 7),
+                        font_col_percentages = cvms::font(size = 7)) +
+  theme(text = element_text(size = 25),
+        axis.text = element_text(colour = "black"))
+```
+

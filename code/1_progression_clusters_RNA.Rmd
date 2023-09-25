@@ -1,0 +1,662 @@
+
+# libraries
+
+```{r include=FALSE}
+library(tidyverse)
+library(parallel)
+library(DESeq2)
+library(clusterProfiler)
+
+library(performance)
+
+rename <- dplyr::rename
+select <- dplyr::select
+```
+
+# udf
+
+```{r udf}
+my_plot_pca = function(mypca, df_out) {
+  okabe <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+  
+  pl_pca =
+    mypca %>%
+    ggplot() +
+    aes(x = PC1,
+        y = PC2,
+        color = group,
+        shape = df_out) +
+    geom_point(size = 3) +
+    theme_bw() +
+    labs(title = "Both groups")
+  
+  withr::with_options(
+    list(ggplot2.discrete.colour = okabe),
+    print(pl_pca)
+  )
+}
+
+plot_tsne = function(data, counts, title) {
+  pl =
+    data %>%
+    mutate(name = counts %>% colnames()) %>%
+    separate_wider_delim(name, "_", names = c("PATNO", "tp")) %>%
+    left_join(df_cohort %>%
+                left_join(df_metadata %>%
+                            select(PATNO, SEX) %>%
+                            distinct(),
+                          by = "PATNO") %>%
+                mutate(PATNO = as.character(PATNO)),
+              by = "PATNO") %>%
+    mutate(SEX = as.factor(SEX)) %>%
+    ggplot() +
+    aes(X1,
+        X2,
+        color = SEX) +
+    geom_point() +
+    theme_bw() +
+    labs(title = title)
+
+  return(pl)
+}
+
+plot_venn = function(venn_obj, title = NULL) {
+  pl = 
+    RVenn::ggvenn(venn_obj,  fill = c("red2", "blue2", "green2")) +
+  expand_limits(x = c(-2,6),
+                y = c(-2.1,3)) +
+  theme_void() +
+  theme(legend.position = "none")
+  
+  if (!is.null(title)) {
+    pl = pl + labs(title = title)
+  }
+  
+  return(pl)
+}
+```
+
+
+# import 
+
+```{r}
+df_cohort = read.csv("../../data/input/study_cohort.csv")
+
+df_metadata = read.csv("../../data/raw/subject_characteristics/Demographics.csv")
+
+# By Zhang 2019
+df_clusters = read.csv("../../data/repos/PPMI-Subtype-Analysis-master/subtype/input/clustering_by_lstm.csv")
+
+df_time = 
+  data.frame(tp = c("BL", "V04", "V06", "V08"),
+             time = c(0, 1, 2, 3))
+```
+
+## rna counts
+
+```{r}
+data_path = "../data/raw/rna_seq/PPMI_RNAseq_IR3_Analysis/counts"
+
+rna_files = list.files(data_path)[str_detect(list.files(data_path), ".txt")] %>% sort()
+
+df_metadata_rna_raw = 
+  rna_files %>% 
+  as.data.frame() %>% 
+  dplyr::rename(filename = ".") %>% 
+  separate_wider_delim(cols = filename,
+                       delim = ".",
+                       names = c("release_version",
+                                 "PATNO", 
+                                 "visit", 
+                                 "sampleID",
+                                 "seq_fac_ID",
+                                 "assay", 
+                                 "analysis",
+                                 "ext"),
+                       cols_remove = F)
+
+df_metadata_cohort = 
+  df_metadata_rna_raw %>% 
+  filter(visit != "POOL") %>% 
+  mutate(PATNO = as.numeric(str_remove(PATNO, "R"))) %>% 
+  right_join(df_cohort,
+             by = "PATNO") %>% 
+  select(PATNO, group, visit, filename) %>% 
+  dplyr::rename(EVENT_ID = visit) %>% 
+  na.omit()
+
+# paths to be imported
+paths_list_by_timepoint =
+  df_metadata_cohort %>%
+  mutate(filename = file.path(data_path, filename)) %>%
+  split(f = .$EVENT_ID) %>%
+  lapply(function(x) x %>% pull(filename))
+
+# set parallel computing
+numCores <- detectCores()-2
+cl <- makeCluster(numCores)
+clusterEvalQ(cl, library(tidyverse, verbose = F, quietly = T))
+
+# import tables by timepoint reading files in parallel
+rna_counts_list_by_timepoint =
+  paths_list_by_timepoint %>%
+  lapply(function(i) i %>%
+           parLapply(X = .,
+                     cl = cl,
+                     fun = function(ii) ii %>%
+                       read.table(header = T) %>%
+                       select(Geneid,
+                              last_col()) %>%
+                       rename(counts = last_col())
+           )
+  )
+
+stopCluster(cl)
+
+# assign names to dfs before binding
+for (i in 1:length(rna_counts_list_by_timepoint)) {
+  names(rna_counts_list_by_timepoint[[i]]) =
+    df_metadata_cohort %>%
+    mutate(filename = file.path(data_path, filename)) %>%
+    split(f = .$EVENT_ID) %>%
+    lapply(function(x) x %>% pull(PATNO)) %>%
+    .[[i]]
+}
+
+# bind to make 4 dfs, one for each timepoint
+rna_counts_list_by_timepoint =
+  rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           bind_rows(.id = "PATNO"))
+rna_counts_list_by_timepoint$V02 <- NULL
+
+
+
+```
+
+# check subjects and clusters
+
+```{r}
+df_group_cl =
+  full_join(
+    df_cohort %>%
+      filter(group == "PD"),
+    df_clusters,
+    by = "PATNO"
+  )
+
+df_group_cl %>%
+  group_by(CLUSTER_IDX) %>%
+  tally()
+
+df_mygroup_cl =
+  df_group_cl %>%
+  mutate(my_group = case_when(is.na(group) ~ "not in my cohort",
+                              is.na(CLUSTER_IDX) ~ "not clustered",
+                              TRUE ~ as.character(CLUSTER_IDX)))
+
+df_mygroup_cl %>%
+  group_by(my_group) %>%
+  tally()
+```
+
+# RNA analysis
+
+# viz
+
+```{r}
+rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           select(PATNO) %>%
+           distinct()) %>%
+  bind_rows(.id = "tp") %>%
+  left_join(df_cohort %>%
+              left_join(df_metadata %>%
+                          select(PATNO, SEX) %>%
+                          distinct(),
+                        by = "PATNO") %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  mutate(cl = case_when(is.na(CLUSTER_IDX) & group == "HC" ~ "HC",
+                        is.na(CLUSTER_IDX) & group == "PD" ~ "UNK",
+                        TRUE ~ as.character(CLUSTER_IDX))) %>%
+  group_by(tp, cl) %>%
+  summarise(n_unique_PATNO = n_distinct(PATNO)) %>%
+  filter(cl != "UNK",
+         tp != "V02") %>% 
+  ggplot() +
+  aes(x = tp,
+      y = n_unique_PATNO,
+      fill = cl) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = n_unique_PATNO),
+            position = position_dodge(width = .9), vjust = -.25) +
+  theme_bw() +
+  scale_fill_manual(values = c("1" = "red2", "2" = "blue2", "3" = "green2", "HC" = "grey50")) +
+  labs(x = NULL, y = "n")
+```
+## table
+
+```{r}
+table_num = 
+rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           select(PATNO) %>%
+           distinct()) %>%
+  bind_rows(.id = "tp") %>%
+  left_join(df_cohort %>%
+              left_join(df_metadata %>%
+                          select(PATNO, SEX) %>%
+                          distinct(),
+                        by = "PATNO") %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  mutate(cl = case_when(is.na(CLUSTER_IDX) & group == "HC" ~ "HC",
+                        is.na(CLUSTER_IDX) & group == "PD" ~ "UNK",
+                        TRUE ~ as.character(CLUSTER_IDX))) %>%
+  group_by(tp, cl) %>%
+  summarise(n_unique_PATNO = n_distinct(PATNO)) %>%
+  filter(cl != "UNK",
+         tp != "V02") %>% 
+  ungroup() %>% 
+  mutate(Timepoint = case_when(tp == "BL" ~ "Baseline",
+                               tp == "V04" ~ "Year 1",
+                               tp == "V06" ~ "Year 2",
+                               tp == "V08" ~ "Year 3"),
+         Group = case_when(cl == "1" ~ "S1",
+                           cl == "2" ~ "S2",
+                           cl == "3" ~ "S3",
+                           TRUE ~ "HC"),
+         .keep = "unused",
+         .before = everything()) %>% 
+  rename(n = n_unique_PATNO)
+
+table_num
+
+# write.xlsx(table_num, "../../data/results/tables/table_numerosity.xlsx")
+```
+
+
+```{r}
+rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           select(PATNO) %>%
+           distinct()) %>%
+  bind_rows(.id = "tp") %>%
+  left_join(df_cohort %>%
+              left_join(df_metadata %>%
+                          select(PATNO, SEX) %>%
+                          distinct(),
+                        by = "PATNO") %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  mutate(cl = case_when(is.na(CLUSTER_IDX) & group == "HC" ~ "HC",
+                        is.na(CLUSTER_IDX) & group == "PD" ~ "UNK",
+                        TRUE ~ as.character(CLUSTER_IDX))) %>%
+  filter(cl != "UNK",
+         tp != "V02") %>%
+  select(PATNO, group) %>%
+  distinct() %>%
+  pull(group) %>%
+  table()
+
+rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           select(PATNO) %>%
+           distinct()) %>%
+  bind_rows(.id = "tp") %>%
+  left_join(df_cohort %>%
+              left_join(df_metadata %>%
+                          select(PATNO, SEX) %>%
+                          distinct(),
+                        by = "PATNO") %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  mutate(cl = case_when(is.na(CLUSTER_IDX) & group == "HC" ~ "HC",
+                        is.na(CLUSTER_IDX) & group == "PD" ~ "UNK",
+                        TRUE ~ as.character(CLUSTER_IDX))) %>%
+  filter(cl != "UNK",
+         tp != "V02") %>% 
+  select(PATNO, cl) %>% 
+  distinct() %>% 
+  pull(cl) %>% 
+  table()
+```
+
+# dds object
+This is needed to perform data preparation
+
+## list
+
+```{r}
+coldata = 
+  rna_counts_list_by_timepoint %>%
+  lapply(function(x) x %>%
+           select(PATNO) %>%
+           distinct()) %>%
+  bind_rows(.id = "tp") %>%
+  left_join(df_cohort %>%
+              left_join(df_metadata %>%
+                          select(PATNO, SEX) %>%
+                          distinct(),
+                        by = "PATNO") %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  left_join(df_clusters %>%
+              mutate(PATNO = as.character(PATNO)),
+            by = "PATNO") %>%
+  mutate(cl = case_when(is.na(CLUSTER_IDX) & group == "HC" ~ "HC",
+                        is.na(CLUSTER_IDX) & group == "PD" ~ "UNK",
+                        TRUE ~ as.character(CLUSTER_IDX))) %>% 
+  mutate(names = paste(PATNO, tp, sep = "_"), .before = everything()) %>%
+  filter(cl != "UNK",
+         tp != "V02") %>% 
+  mutate(cl = ifelse(cl == "HC", cl, paste0("cl_", cl))) %>% 
+  rename(time = tp,
+         patno = PATNO,
+         condition = group,
+         cluster = cl,
+         sex = SEX) %>% 
+  select(names, patno, condition, cluster, time, sex) %>% 
+  mutate(across(everything(), as.factor)) %>% 
+  mutate(cluster = factor(cluster, levels = c("HC", "cl_1", "cl_2", "cl_3")))
+
+coldata
+
+countdata = 
+  rna_counts_list_by_timepoint %>% 
+  bind_rows(.id = "tp") %>%
+  mutate(names = paste(PATNO, tp, sep = "_")) %>%
+  filter(names %in% coldata$names) %>% 
+  select(-PATNO, -tp) %>%
+  pivot_wider(names_from = names,
+              values_from = counts) %>%
+  column_to_rownames("Geneid")
+
+dds =
+  DESeqDataSetFromMatrix(
+    countData = countdata,
+    colData = coldata,
+    design = ~ cluster + time + cluster:time
+  )
+```
+
+# QC
+
+## outliers
+
+### vst
+
+```{r}
+vsd = vst(dds)
+```
+
+### pca
+
+```{r}
+df_pca = plotPCA(vsd,
+                 ntop = 20000,
+                 intgroup = "cluster",
+                 returnData = T)
+```
+
+#### outliers
+
+```{r}
+df_out = check_outliers(df_pca$PC1,
+               method = "hdi",
+               threshold = 0.99)
+df_out
+```
+
+#### viz
+
+```{r}
+my_plot_pca(df_pca,
+            df_out)
+```
+
+## true sex
+
+sex incompatibility checks using gene expression data from six sex chromosome genes: XIST, RPS4Y1, RPS4Y2, KDM5D, DDX3Y and USP9Y; from this set of genes, samples were clustered using t-SNE.
+
+ENSG00000229807
+ENSG00000129824
+ENSG00000280969
+ENSG00000012817
+ENSG00000067048
+ENSG00000114374
+
+```{r}
+counts_sex =
+  countdata %>%
+  filter(word(rownames(.), 1, sep = "\\.") %in% c("ENSG00000229807",
+                                                  "ENSG00000129824",
+                                                  "ENSG00000280969",
+                                                  "ENSG00000012817",
+                                                  "ENSG00000067048",
+                                                  "ENSG00000114374"
+                                                ))
+
+# la sostituisco con quest'altra
+set.seed(211)
+tsne_obj = Rtsne::Rtsne(X = counts_sex %>%
+                          t() %>%
+                          as.data.frame(),
+                        check_duplicates = F)
+```
+
+
+```{r}
+plot_tsne(tsne_obj$Y %>%
+            as.data.frame() %>%
+            `names<-`(c("X1", "X2")),
+          counts_sex,
+          title = "Both groups")
+```
+
+```{r}
+db = fpc::dbscan(scale(tsne_obj$Y),
+                 eps = 0.41)
+
+factoextra::fviz_cluster(db,
+                         scale(tsne_obj$Y) %>%
+                           as.data.frame(),
+                         geom = "point",
+                         main =  "Both groups")
+```
+
+True sex table
+
+```{r}
+true_sex_metadata =
+  data.frame(
+    names = counts_sex %>%
+      colnames(),
+    cl = db$cluster
+  ) %>%
+  distinct() %>%
+  mutate(true_sex = case_when(cl == 2 ~ 1,
+                              cl != 2 ~ 0)) %>% 
+  select(-cl) %>% 
+  left_join(coldata %>% 
+              select(names, sex), 
+            by = "names") %>% 
+  mutate(is_wrong = true_sex != sex)
+```
+
+```{r}
+wrong_sex_names =
+  true_sex_metadata %>%
+  filter(is_wrong) %>% 
+  pull(names)
+```
+# Differential expression analysis
+
+## dds
+```{r}
+comp_list = 
+  list(c("HC", "cl_1"), 
+       c("HC", "cl_2"), 
+       c("HC", "cl_3"))
+
+countdata_list_de = vector("list", length = length(comp_list))
+coldata_list_de = vector("list", length = length(comp_list))
+dds_list_de = vector("list", length = length(comp_list))
+
+for (i in 1:length(comp_list)) {
+  
+  countdata_list_de[[i]] = 
+    countdata %>% 
+    .[, ( colnames(.) ) %in% ( coldata %>%  
+                                 filter(cluster %in% comp_list[[i]]) %>% 
+                                 pull(names) %>% 
+                                 as.character() )] %>% # only keep subjects needed for this comparison
+    .[, !( colnames(.) ) %in% ( wrong_sex_names )] %>% # remove subjects with wrong sex
+    .[, !( colnames(.) ) %in% ( df_pca %>% 
+                                  mutate(out = df_out) %>% 
+                                  filter(out) %>% 
+                                  rownames() )] #  remove the outliers identified with hdi
+  
+  coldata_list_de[[i]] =
+    coldata %>% 
+    filter(names %in% ( coldata %>%  
+                          filter(cluster %in% comp_list[[i]]) %>% 
+                          pull(names) %>% 
+                          as.character() )) %>% 
+    filter(! names %in% wrong_sex_names) %>% 
+    filter(! names %in% ( df_pca %>% 
+                            mutate(out = df_out) %>% 
+                            filter(out) %>% 
+                            rownames() )) %>% 
+    mutate(across(everything(), droplevels))
+  
+  dds_list_de[[i]] =
+    DESeqDataSetFromMatrix(
+      countData = countdata_list_de[[i]],
+      colData = coldata_list_de[[i]],
+      design = ~ cluster + time + cluster:time
+    )
+}
+```
+
+### export
+
+```{r}
+save(countdata_list_de,
+     coldata_list_de,
+     dds_list_de,
+     file = "../../data/input/dds_objs_de.RData")
+```
+
+## analysis
+
+```{r}
+ddsTC_list_de = vector("list", length = length(comp_list))
+
+for (i in 1:length(comp_list)) {
+  ddsTC_list_de[[i]] =
+    DESeq(dds_list_de[[i]], 
+          test = "LRT",
+          reduced = ~ cluster + time,
+          parallel = T)
+}
+
+resTC_list_de = vector("list", length = length(comp_list))
+for (i in 1:length(comp_list)) {
+  resTC_list_de[[i]] = results(ddsTC_list_de[[i]])
+}
+
+resTC_list_de %>% lapply(summary)
+```
+
+### export
+
+```{r}
+save(ddsTC_list_de,
+     resTC_list_de,
+     file = "../../data/input/ddsTC_resTC_de.RData")
+```
+
+# extract results
+
+compute new p adjusted
+
+```{r}
+df_overall_results = 
+  resTC_list_de %>% 
+  `names<-`(c("bl_vs_cl1", "bl_vs_cl2", "bl_vs_cl3")) %>% 
+  lapply(as.data.frame) %>% 
+  bind_rows(.id = "comparison") %>% 
+  arrange(pvalue) %>% 
+  mutate(my_padj = p.adjust(p = pvalue,
+                            method = "fdr"),
+         my_padj = ifelse(is.na(padj), NA, my_padj),
+         my_padj = ifelse(is.na(pvalue), NA, my_padj)) %>% 
+  mutate(result = case_when(log2FoldChange > 0 & my_padj < 0.1 ~ "up", 
+                            log2FoldChange < 0 & my_padj < 0.1 ~ "down",
+                            TRUE ~ "NS"))
+
+df_overall_results_summary = 
+  df_overall_results %>% 
+  group_by(comparison) %>% 
+  summarise(lfc_up = sum(log2FoldChange > 0 & my_padj < 0.1,
+                         na.rm = T),
+            lfc_down = sum(log2FoldChange < 0 & my_padj < 0.1,
+                           na.rm = T)) %>% 
+  pivot_longer(cols = contains("_"))
+
+df_overall_results_summary
+```
+
+# venn 
+
+```{r}
+venn_obj = 
+  df_overall_results %>% 
+  filter(result != "NS") %>% 
+  split(f = .$comparison) %>% 
+  lapply(rownames) %>% 
+  lapply(function(x) sub("\\.{3}.*", "", x)) %>% 
+  `names<-`(c("S1", "S2", "S3")) %>% 
+  RVenn::Venn()
+
+plot_venn(venn_obj)
+
+ggsave("../../data/plots/degs_venn.png", 
+       bg = "white",
+       width = 15,
+       height = 15,
+       units = "cm",
+       dpi = 300)
+```
+
+## export
+
+```{r}
+degs_export = 
+  df_overall_results %>% 
+  split(.$comparison) %>% 
+  lapply(function(x) x %>% 
+           rownames_to_column("gene") %>% 
+           filter(!grepl("PAR_Y", gene)) %>% 
+           mutate(gene = sub("\\..*", "", gene)) %>% 
+           na.omit()  # con questo uso il filtraggio fatto da DESEQ
+  )
+
+c(degs_export, 
+  list(summary = df_overall_results_summary)) %>% 
+  openxlsx::write.xlsx(file = "../../data/results/degs_cl.xlsx")
+```

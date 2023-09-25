@@ -1,0 +1,394 @@
+# libraries
+```{r}
+library(tidyverse)
+source("functions.r")
+library(openxlsx)
+library(rrvgo)
+library(GOSemSim)
+library(patchwork)
+
+library(enrichplot)
+library(clusterProfiler)
+
+library(parallel)
+
+select <- dplyr::select
+rename <- dplyr::rename
+```
+
+# udf
+
+```{r}
+rearrange_list <- function(original_list) {
+  # Extract the keys from the original list
+  keys <- names(original_list[[1]])
+  
+  # Initialize an empty list to hold the rearranged data
+  rearranged_list <- list()
+  
+  # Iterate over the keys
+  for (key in keys) {
+    # Create a new sub-list for each key
+    rearranged_list[[key]] <- list()
+    
+    # Iterate over the items in the original list
+    for (name in names(original_list)) {
+      # Add the item to the rearranged list under the appropriate key
+      rearranged_list[[key]][[name]] <- original_list[[name]][[key]]
+    }
+  }
+  
+  return(rearranged_list)
+}
+
+plot_venn = function(venn_obj, title = NULL) {
+  pl = 
+    RVenn::ggvenn(venn_obj, fill = c("red2", "blue2", "green2")) +
+  expand_limits(x = c(-2,6),
+                y = c(-2.1,3)) +
+  theme_void() +
+  theme(legend.position = "none")
+  
+  if (!is.null(title)) {
+    pl = pl + labs(title = title)
+  }
+  
+  return(pl)
+}
+
+grid_arrange_plots <- 
+  function(plot_list, y_label_text_size = 8) {
+    (
+      ((plot_list[[1]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[1]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size)))) |
+        ((plot_list[[2]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[2]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size))))
+    ) / (
+      ((plot_list[[3]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[3]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size)))) |
+        ((plot_list[[4]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[4]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size))))
+    ) / (
+      ((plot_list[[5]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[5]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size)))) |
+        ((plot_list[[6]][[1]] + theme(axis.title.y = element_text(size = y_label_text_size))) / (plot_list[[6]][[2]] + theme(axis.title.y = element_text(size = y_label_text_size))))
+    )
+  }
+
+gsInfo = function (object, geneSetID) 
+{
+  geneList <- object@geneList
+  if (is.numeric(geneSetID)) 
+    geneSetID <- object@result[geneSetID, "ID"]
+  geneSet <- object@geneSets[[geneSetID]]
+  exponent <- object@params[["exponent"]]
+  df <- gseaScores(geneList, geneSet, exponent, fortify = TRUE)
+  df$ymin <- 0
+  df$ymax <- 0
+  pos <- df$position == 1
+  h <- diff(range(df$runningScore))/20
+  df$ymin[pos] <- -h
+  df$ymax[pos] <- h
+  df$geneList <- geneList
+  if (length(object@gene2Symbol) == 0) {
+    df$gene <- names(geneList)
+  }
+  else {
+    df$gene <- object@gene2Symbol[names(geneList)]
+  }
+  df$Description <- object@result[geneSetID, "Description"]
+  return(df)
+}
+gseaScores <- getFromNamespace("gseaScores", "DOSE")
+
+extract_minmax_running_enrichment_score = function(x, geneSetID) {
+  # x is gseaResult object
+  gsdata = gsInfo(x, geneSetID = geneSetID)
+  enrichmentScore = x@result[geneSetID, "enrichmentScore"]
+  
+  return(which.min(abs(gsdata$runningScore - enrichmentScore)))
+}
+
+change_list_structure <- function(input_list) {
+  new_list <- list()
+  index <- 1
+  
+  # Iterate through each element in the input list
+  for (elem_name in names(input_list)) {
+    elem <- input_list[[elem_name]]
+    
+    # Iterate through each sub-element in the element
+    for (sub_name in names(elem)) {
+      sub_elem <- elem[[sub_name]]
+      
+      # Create a new object name by combining the element name, sub-element name, and "_"
+      new_obj_name <- paste(elem_name, sub_name, sep = "_")
+      
+      # Assign the sub-element to the new object name in the new list
+      new_list[[new_obj_name]] <- sub_elem
+      
+      # Increment the index
+      index <- index + 1
+    }
+  }
+  
+  return(new_list)
+}
+
+my_dotplot = function(df, title) {
+  df %>% 
+  ggplot() +
+  aes(x = NES,
+      y = reorder(Description, NES),
+      colour = qvalue,
+      size = setSize) +
+  geom_point() + 
+  scale_color_gradient(low="blue", high="red") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 1),
+        axis.text.x = element_text(colour = "black"),
+        axis.text.y = element_text(colour = "black"),
+        panel.grid.minor = element_blank()) +
+  guides(color = guide_colorbar(order = 1), 
+         size = guide_legend(order = 2)) +
+  labs(colour = "qvalue", 
+       y = NULL,
+       x = "Normalized Enrichment Score",
+       title = title)
+}
+```
+
+# import
+
+```{r}
+df_overall_results = readallsheets("../data/results/degs_cl.xlsx")[1:3] %>% bind_rows()
+```
+
+# gsea
+
+## gene list
+```{r}
+genes_lists = 
+  df_overall_results %>% 
+  split(f = .$comparison) %>% 
+  lapply(function(x) x %>% 
+           select(gene, log2FoldChange) %>% 
+           na.omit() %>%
+           mutate(rank = rank(log2FoldChange,
+                              ties.method = "random"),
+                  is_dup_fc = duplicated(log2FoldChange),
+                  is_dup_gene = duplicated(gene)) %>% 
+           arrange(-rank) %>%
+           {setNames(.$log2FoldChange, .$gene)})
+```
+
+## GO
+
+```{r}
+# create a cluster object with desired number of cores
+cl <- makeCluster(detectCores())
+
+clusterCall(cl = cl,
+            function() {
+              library(clusterProfiler)
+              library(tidyverse)
+              set.seed(217)
+            } )
+
+# apply gseGO function to each chunk in parallel using parLapply
+gse_list <-
+  genes_lists %>%
+  parLapply(cl = cl,
+            X = .,
+            function(x) {
+              gseGO(geneList = x,
+                    ont = "ALL",
+                    keyType = "ENSEMBL",
+                    OrgDb = "org.Hs.eg.db",
+                    maxGSSize = 50000,
+                    eps = 1e-300,
+                    nPermSimple = 10000,
+                    pAdjustMethod = "fdr",
+                    seed = T)
+            })
+
+# stop the cluster
+stopCluster(cl)
+```
+
+## KEGG
+
+### convert to entrez
+
+```{r}
+# genes_lists
+
+entrez_genes_lists = 
+  genes_lists %>% 
+  lapply(names) %>% 
+  lapply(
+    function(x) bitr(geneID = x,
+                     fromType = "ENSEMBL",
+                     toType = "ENTREZID",
+                     OrgDb="org.Hs.eg.db",
+                     drop = F)
+  )
+
+entrez_genes_lists %>% 
+  lapply(function(x) sum(is.na(x$ENTREZID))/nrow(x)*100)
+
+genes_lists_kegg = vector("list", length = length(genes_lists))
+names(genes_lists_kegg) = names(genes_lists)
+for (i in 1:length(genes_lists)) {
+  genes_lists_kegg[[i]] =
+    genes_lists[[i]] %>% 
+    as.data.frame() %>%  
+    rownames_to_column(var = "ENSEMBL") %>% 
+    rename(value = ".") %>% 
+    left_join(entrez_genes_lists[[i]],
+              by = "ENSEMBL") %>% 
+    na.omit() %>% 
+    select(ENTREZID, value) %>% 
+    arrange(-value) %>%
+    {setNames(.$value, .$ENTREZID)}
+}
+```
+
+### gsea
+```{r}
+# create a cluster object with desired number of cores
+cl <- makeCluster(detectCores())
+
+clusterCall(cl = cl,
+            function() {
+              library(clusterProfiler)
+              library(tidyverse)
+              set.seed(217)
+            } )
+
+# apply gseGO function to each chunk in parallel using parLapply
+kegg_list <-
+  genes_lists_kegg %>%
+  parLapply(cl = cl,
+            X = .,
+            function(x) {
+              gseKEGG(geneList = x,
+                      organism = "hsa",
+                      maxGSSize = 50000,
+                      eps = 1e-300,
+                      nPermSimple = 10000,
+                      seed = T
+              )
+            })
+
+# stop the cluster
+stopCluster(cl)
+```
+
+## WikiPathways
+
+
+### gsea
+```{r}
+# create a cluster object with desired number of cores
+cl <- makeCluster(detectCores())
+
+clusterCall(cl = cl,
+            function() {
+              library(clusterProfiler)
+              library(tidyverse)
+              set.seed(217)
+            } )
+
+# apply gseGO function to each chunk in parallel using parLapply
+wp_list <-
+  genes_lists_kegg %>%
+  parLapply(cl = cl,
+            X = .,
+            function(x) {
+              gseWP(geneList = x,
+                    organism = "Homo sapiens",
+                    maxGSSize = 50000,
+                    eps = 1e-300,
+                    nPermSimple = 10000,
+                    seed = T
+              )
+            })
+
+# stop the cluster
+stopCluster(cl)
+```
+
+
+# Semantic Similarity
+
+rrvgo http://www.bioconductor.org/packages/release/bioc/vignettes/rrvgo/inst/doc/rrvgo.html
+
+## GO
+
+```{r}
+orgdb = "org.Hs.eg.db"
+
+# calculate similarity matrices
+sim_matrices_list =
+  rec.list(
+    c(
+      length(df_go_list),
+      df_go_list[[1]] %>%
+        pull(ONTOLOGY) %>%
+        n_distinct()
+    )
+  )
+names(sim_matrices_list) = names(df_go_list)
+for (i in 1:length(sim_matrices_list)) {
+  
+  names(sim_matrices_list[[i]]) = 
+    df_go_list[[1]] %>%
+    pull(ONTOLOGY) %>%
+    unique()
+  
+  for (ii in 1:length(sim_matrices_list[[i]])) {
+    
+    sim_matrices_list[[i]][[ii]] =
+      calculateSimMatrix(x = df_go_list[[i]] %>% 
+                           filter(ONTOLOGY == names(sim_matrices_list[[i]])[ii]) %>% 
+                           pull(ID),
+                         orgdb = orgdb,
+                         ont = names(sim_matrices_list[[i]])[ii],
+                         method = "Rel")
+  }
+}
+
+# set named scores vectors
+scores_list = sim_matrices_list # ne copia la struttura
+for (i in 1:length(sim_matrices_list)) {
+  for (ii in 1:length(sim_matrices_list[[i]])) {
+    scores_list[[i]][[ii]] =
+      setNames(-log10(df_go_list[[i]] %>% 
+                        filter(ONTOLOGY == names(sim_matrices_list[[i]])[[ii]]) %>% 
+                        pull(qvalue)),
+               df_go_list[[i]] %>% 
+                 filter(ONTOLOGY == names(sim_matrices_list[[i]])[[ii]]) %>% 
+                 pull(ID))
+  }
+}
+
+# reduce initial GO terms
+reduced_terms_list = sim_matrices_list # ne copia la struttura
+for (i in 1:length(sim_matrices_list)) {
+  for (ii in 1:length(sim_matrices_list[[i]])) {
+    reduced_terms_list[[i]][[ii]] =
+      reduceSimMatrix(simMatrix = sim_matrices_list[[i]][[ii]],
+                      scores = scores_list[[i]][[ii]],
+                      threshold = 0.7,
+                      orgdb = "org.Hs.eg.db")
+  }
+}
+```
+
+filter to keep only parents
+
+```{r}
+only_parents_list = 
+  reduced_terms_list %>% 
+  lapply(function(i) i %>% 
+           lapply(function(ii) ii %>% 
+                    arrange(cluster, -score) %>% 
+                    filter(go %in% unique(parent))))
+```
+
